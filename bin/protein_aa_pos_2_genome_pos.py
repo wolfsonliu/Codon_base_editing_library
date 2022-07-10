@@ -12,9 +12,526 @@ import numpy as np
 import pandas as pd
 import argparse
 from Bio import SeqIO
-sys.path.append('/gpfs/share/home/1501111485/Code/pycas')
-import pycas
-from pycas.utils.gff import Gff, GffFile
+
+####################
+# gff
+
+# -*-coding:utf-8-*-
+
+# GFF format
+# 1. seqname: 'chr1', 'chr2', ..., 'chr22', 'chrX', 'chrY'
+# 2. source:
+# 3. feature: 'gene', 'exon', 'intron', 'CDS', 'region', ...
+# 4. start: number of start site
+# 5. end: number of end site
+# 6. score: score number
+# 7. strand: '+', '-', '.'
+# 8. frame: The frame of the coding sequence. '0', '1', '2', '.'
+# 9. attribute:
+
+
+# ------------------
+# Functions
+# ------------------
+
+def regionseq(seqname, seq, start, end):
+    # get the sequences by start and end for the input.
+    region = pd.concat(
+        [pd.Series(start), pd.Series(end)],
+        axis=1
+    )
+    region.columns = ['start', 'end']
+    region['seq'] = region.apply(
+        lambda x: ''.join(list(seq[x['start']:x['end']])),
+        axis=1
+    )
+    region['seqname'] = [seqname] * region.shape[0]
+    return region[['seqname', 'start', 'end', 'seq']]
+
+def gff_overlap(gff1, gff2):
+    # gff1 and gff2 should be pd.DataFrame
+    def apinbr(ap, bs, be):
+        # a point in b region
+        # ap, bs, be should be pd.Series
+        if len(bs) != len(be):
+            raise ValueError('bs should have same length with be')
+        ap = pd.Series(ap)
+        bs = pd.Series(bs)
+        be = pd.Series(be)
+        dim = (len(ap), len(bs))
+        one = np.array([np.array(x) for x in ap.map(lambda x: x >= bs)])
+        one.shape = dim
+        two = np.array([np.array(x) for x in ap.map(lambda x: x <= be)])
+        two.shape = dim
+        return np.where(np.logical_and(one, two))
+
+    def chr_overlap(gff1, gff2):
+        # get the index and columns of two gff file for same chromosome
+        gff1colnames = gff1.columns + '.1'
+        gff2colnames = gff2.columns + '.2'
+        gff1index = gff1.index      # gff1 index
+        gff2index = gff2.index      # gff2 index
+        # get the pairs of gff1 overlap gff2
+        # gff1 left overlap gff2
+        one_left = apinbr(gff1['start'], gff2['start'], gff2['end'])
+        # gff1 right overlap gff2
+        one_right = apinbr(gff1['end'], gff2['start'], gff2['end'])
+        # gff2 left overlap gff1
+        two_left = apinbr(gff2['start'], gff1['start'], gff1['end'])
+        # gff2 right overlap gff1
+        two_right = apinbr(gff2['end'], gff1['start'], gff1['end'])
+        # merge two kinds of overlaps
+        allpairs = (
+            np.concatenate(
+                (one_left[0], one_right[0], two_left[1], two_right[1])
+            ),
+            np.concatenate(
+                (one_left[1], one_right[1], two_left[0], two_right[0])
+            )
+        )
+        pairindex = [
+            '{0}.{1}'.format(
+                gff1index[allpairs[0][i]],
+                gff2index[allpairs[1][i]]
+            )
+            for i in range(len(allpairs[0]))
+        ]
+        notduplicated = np.where(
+            np.logical_not(pd.Series(pairindex).duplicated())
+        )
+        allpair_rd = (allpairs[0][notduplicated], allpairs[1][notduplicated])
+        # get the gff1 in overlaps
+        gff1side = gff1.loc[gff1index[allpair_rd[0]]].reset_index(drop=True)
+        # get the gff1 in overlaps
+        gff2side = gff2.loc[gff2index[allpair_rd[1]]].reset_index(drop=True)
+        # merge two gff data
+        gffpaired = pd.concat([gff1side, gff2side], axis=1)
+        gffpaired.columns = gff1colnames.append(gff2colnames)
+        return gffpaired
+
+    resultlist = list()
+    for seqname in gff1['seqname'].unique():
+        resultlist.append(
+            chr_overlap(
+                gff1.loc[gff1['seqname'] == seqname],
+                gff2.loc[gff2['seqname'] == seqname]
+            )
+        )
+    result = pd.concat(resultlist, axis=0)
+    return result
+
+
+def gff_not_overlap(gff1, gff2):
+    overlap = gff_overlap(gff1, gff2)
+    gff1str = gff1['seqname'] + ':' + gff1['start'].map(str) + '-' + gff1['end'].map(str)
+    gff2str = gff2['seqname'] + ':' + gff2['start'].map(str) + '-' + gff2['end'].map(str)
+    overlap1str = overlap['seqname.1'] + ':' + overlap['start.1'].map(str) + '-' + overlap['end.1'].map(str)
+    overlap2str = overlap['seqname.2'] + ':' + overlap['start.2'].map(str) + '-' + overlap['end.2'].map(str)
+    gff1notoverlap = gff1.loc[np.logical_not(gff1str.isin(overlap1str))]
+    gff2notoverlap = gff2.loc[np.logical_not(gff2str.isin(overlap2str))]
+    return (gff1notoverlap, gff2notoverlap)
+
+
+def gff_inmerge(gff1, gff2, method='intersect'):
+    # get the merged common region in two gffs
+    # method: intersect, union
+    overlap = gff_overlap(gff1, gff2)
+    colname2del = list(overlap.columns)
+    overlap['seqname'] = overlap['seqname.1']
+    overlap['source'] = overlap['source.1'] + '.' + overlap['source.2']
+    overlap['feature'] = overlap['feature.1'] + '.' + overlap['feature.2']
+    overlap['frame'] = overlap['frame.1'] + '.' + overlap['frame.2']
+    if method == 'intersect':
+        overlap['start'] = overlap[['start.1', 'start.2']].max(axis=1)
+        overlap['end'] = overlap[['end.1', 'end.2']].min(axis=1)
+    elif method == 'union':
+        overlap['start'] = overlap[['start.1', 'start.2']].min(axis=1)
+        overlap['end'] = overlap[['end.1', 'end.2']].max(axis=1)
+    else:
+        raise ValueError('Method should be intersect or union.')
+    overlap['score'] = overlap['score.1']
+    overlap['strand'] = overlap[['strand.1', 'strand.2']].apply(
+        lambda x: x['strand.1'] if x['strand.1'] == x['strand.2'] else '.',
+        axis=1
+    )
+    overlap['attribute'] = overlap['attribute.1'] + '.' + overlap['attribute.2']
+    # remove old columns
+    for x in colname2del:
+        del overlap[x]
+    # return results
+    return overlap.reset_index(drop=True)
+
+
+def gff_collapse(gff):
+    # merge overlaped region in one gff
+    selfmerge = gff_inmerge(gff, gff, 'union')
+    # remove small end
+    selfmerge2 = selfmerge.groupby(
+        [
+            'seqname', 'source', 'feature', 'frame',
+            'start', 'score', 'strand', 'attribute'
+        ]
+    ).apply(
+        lambda x: x['end'].max()
+    )
+    selfmerge2.name = 'end'
+    selfmerge2 = selfmerge2.reset_index()[selfmerge.columns]
+    # remove large start
+    selfmerge3 = selfmerge2.groupby(
+        [
+            'seqname', 'source', 'feature', 'frame',
+            'end', 'score', 'strand', 'attribute'
+        ]
+    ).apply(
+        lambda x: x['start'].min()
+    )
+    selfmerge3.name = 'start'
+    selfmerge3 = selfmerge3.reset_index()[selfmerge.columns]
+    return selfmerge3
+
+
+def gff_intersect(gff1, gff2):
+    # get the intersect of gff
+    result = gff_inmerge(gff1, gff2, 'intersect')
+    return result
+
+
+def gff_union(gff1, gff2):
+    # get the union of gff
+    result = gff_inmerge(gff1, gff2, 'union')
+    result = gff_collapse(result)
+    return result
+
+
+def gff_merge(gff1, gff2, method='union'):
+    # get merged gff
+    overlap = gff_inmerge(gff1, gff2, method=method)
+    notoverlap = pd.concat(
+        gff_not_overlap(gff1, gff2)
+    ).reset_index(drop=True)
+    result = pd.concat([overlap, notoverlap]).reset_index(drop=True)
+    return result
+
+
+def gff_subtract(gff1, gff2):
+    # subtract the intersect region from gff1
+    pass
+
+
+# ------------------
+# Variables
+# ------------------
+
+
+
+# ------------------
+# Errors
+# ------------------
+
+
+class GFFError(ValueError):
+    pass
+
+
+# ------------------
+# Classes
+# ------------------
+
+
+
+class Gff:
+    def __init__(self,
+                 seqname,
+                 source,
+                 feature,
+                 start,
+                 end,
+                 score,
+                 strand,
+                 frame,
+                 attribute,
+                 log_level='info'):
+        # make gff DataFrame
+        self.gff = pd.DataFrame(
+            {
+                'seqname': seqname,
+                'source': source,
+                'feature': feature,
+                'start': start,
+                'end': end,
+                'score': score,
+                'strand': strand,
+                'frame': frame,
+                'attribute': attribute
+            }
+        )
+        self.gff = self.gff[
+            ['seqname', 'source', 'feature', 'start', 'end',
+             'score', 'strand', 'frame', 'attribute']
+        ]
+        self.loc = self.gff.loc
+        self.index = self.gff.index
+        self.columns = self.gff.columns
+        self.shape = self.gff.shape
+
+    def __getitem__(self, key):
+        return self.gff[key]
+
+    def __len__(self):
+        return len(self.gff)
+
+    def __repr__(self):
+        return self.gff.__repr__()
+
+    def head(self, n=5):
+        return self.loc[0:n,]
+
+    def tail(self, n=5):
+        rows=self.gff.shape[0]
+        return self.loc[list(range(rows - n, rows)),]
+
+    def intersect(self, gff):
+        outtype = 'DF'
+        if isinstance(gff, Gff):
+            inputgff = gff.gff
+            outtype = 'Gff'
+        elif isinstance(gff, pd.DataFrame):
+            inputgff = gff
+        else:
+            raise TypeError('Only accept Gff or DataFrame class.')
+        result = gff_intersect(self.gff, gff)
+        if outtype == 'Gff':
+            result = Gff(
+                result['seqname'],
+                result['source'],
+                result['feature'],
+                result['start'],
+                result['end'],
+                result['score'],
+                result['strand'],
+                result['frame'],
+                result['attribute']
+            )
+        return result
+
+    def union(self, gff):
+        outtype = 'DF'
+        if isinstance(gff, Gff):
+            inputgff = gff.gff
+            outtype = 'Gff'
+        elif isinstance(gff, pd.DataFrame):
+            inputgff = gff
+        else:
+            raise TypeError('Only accept Gff or DataFrame class.')
+        result = gff_union(self.gff, gff)
+        if outtype == 'Gff':
+            result = Gff(
+                result['seqname'],
+                result['source'],
+                result['feature'],
+                result['start'],
+                result['end'],
+                result['score'],
+                result['strand'],
+                result['frame'],
+                result['attribute']
+            )
+        return result
+
+    def merge(self, gff, method='union'):
+        outtype = 'DF'
+        if isinstance(gff, Gff):
+            inputgff = gff.gff
+            outtype = 'Gff'
+        elif isinstance(gff, pd.DataFrame):
+            inputgff = gff
+        else:
+            raise TypeError('Only accept Gff or DataFrame class.')
+        result = gff_merge(self.gff, inputgff, method)
+        if outtype == 'Gff':
+            result = Gff(
+                result['seqname'],
+                result['source'],
+                result['feature'],
+                result['start'],
+                result['end'],
+                result['score'],
+                result['strand'],
+                result['frame'],
+                result['attribute']
+            )
+        return result
+
+    def overlap(self, gff):
+        outtype = 'DF'
+        if isinstance(gff, Gff):
+            inputgff = gff.gff
+            outtype = 'Gff'
+        elif isinstance(gff, pd.DataFrame):
+            inputgff = gff
+        else:
+            raise TypeError('Only accept Gff or DataFrame class.')
+        result = gff_overlap(self.gff, inputgff)
+        if outtype == 'Gff':
+            result = Gff(
+                result['seqname'],
+                result['source'],
+                result['feature'],
+                result['start'],
+                result['end'],
+                result['score'],
+                result['strand'],
+                result['frame'],
+                result['attribute']
+            )
+        return result
+
+    def not_overlap(self, gff):
+        outtype = 'DF'
+        if isinstance(gff, Gff):
+            inputgff = gff.gff
+            outtype = 'Gff'
+        elif isinstance(gff, pd.DataFrame):
+            inputgff = gff
+        else:
+            raise TypeError('Only accept Gff or DataFrame class.')
+        result = gff_not_overlap(self.gff, inputgff)
+        if outtype == 'Gff':
+            result = Gff(
+                result['seqname'],
+                result['source'],
+                result['feature'],
+                result['start'],
+                result['end'],
+                result['score'],
+                result['strand'],
+                result['frame'],
+                result['attribute']
+            )
+        return result
+
+    def get_seq(self, seqdict):
+        # return sequences from seq dict, with seq name as key and
+        # sequence string as value
+        if not isinstance(seqdict, dict):
+            raise TypeError(
+                'seqdict should be a dict contains sequence string, with seqname as dict keys.'
+            )
+        result = dict()
+        for x in self.gff['seqname'].unique():
+            result[x] = regionseq(
+                x, seqdict[x],
+                self.gff['start'][self.gff['seqname'] == x].tolist(),
+                self.gff['end'][self.gff['seqname'] == x].tolist()
+            )
+        return pd.concat(result.values(), axis=0)
+
+
+class GffFile:
+    '''
+    Manage gff or gtf file
+    '''
+    def __init__(self,
+                 gfffile,
+                 header=None,
+                 log_level='info'):
+
+        self.__colnames = ['seqname', 'source', 'feature',
+                           'start', 'end', 'score',
+                           'strand', 'frame', 'attribute']
+        self.gfffile = gfffile
+        self.__format = self.gfffile.split('.')[-1]
+        parsegff = self.__parsegff(
+            self.gfffile,
+            self.__format,
+            header
+        )
+        self.gff = Gff(
+            parsegff['seqname'],
+            parsegff['source'],
+            parsegff['feature'],
+            parsegff['start'],
+            parsegff['end'],
+            parsegff['score'],
+            parsegff['strand'],
+            parsegff['frame'],
+            parsegff['attribute']
+        )
+        attrcol = [x for x in parsegff.columns if x not in self.__colnames]
+        self.gffattr = parsegff[attrcol]
+
+    def __parsegff(self, filename, fileformat, header):
+        '''
+        Parse gff3 or gtf file into pandas DataFrame.
+        Parameters
+        ----------
+        filename: the file path of the gff3 or gtf file.
+        fileformat: the format of file, should be "gtf" or "gff".
+        columns: the column names of the file.
+        Returns
+        -------
+        DataFrame stored parsed information from gff or gtf
+        Examples
+        --------
+        >>> import pandas as pd
+        >>> mygff = parsegff(
+                './hsa.gtf',
+                'gtf',
+                ['seqname', 'source', 'feature', 'start', 'end',
+                 'score', 'strand', 'frame', 'attribute']
+            )
+        '''
+        if fileformat == 'gtf':
+            # make different separation according to fileformat.
+            sep1, sep2 = ' ', '; '
+        elif fileformat == 'gff3' or fileformat == 'gff':
+            sep1, sep2 = '=', ';'
+        data = pd.read_table(
+            filename,
+            sep='\t',
+            header=header,
+            index_col=False,
+            comment='#'
+        )                           # read gtf/gff data
+        data.columns = self.__colnames
+        attr_split = data[self.__colnames[-1]].apply(
+            lambda row: [
+                [y.replace(';"', '') for y in x.split(sep1)]
+                for x in row.split(sep2) if len(x) > 2
+            ]
+        )
+        # split the attributes in attribute columns
+        attr_dict = attr_split.apply(dict)
+        # make splited attributes into dicts
+        attr_columns = attr_dict.apply(
+            lambda row: list(row.keys())
+        ).tolist()                  # get attr columns names
+        attr_names = list(
+            set([
+                attr_columns[i][j] for i in range(len(attr_columns))
+                for j in range(len(attr_columns[i]))
+            ])
+        )
+        # get attr columns names
+        attr = pd.DataFrame(
+            dict(
+                zip(
+                    attr_names,
+                    [
+                        pd.Series(
+                            [x[attr_name] if attr_name in x else np.NaN
+                             for x in attr_dict]
+                        ) for attr_name in attr_names
+                    ]
+                )
+            )
+        )                           # make attr columns
+        data = data.join(
+            attr
+        )
+        # link attr columns with annotation.
+        return data
+
 
 ####################
 

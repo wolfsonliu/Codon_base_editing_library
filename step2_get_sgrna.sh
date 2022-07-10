@@ -50,7 +50,7 @@ for x in no_splicing splicing_12link; do
         -a 13 14 18 -l 20 \
         -o ${SGRNA_DIR}/k_sgrna_${x}_13-14-18_20.txt &
 
-    python3 ${BASE_DIR}/get_sgrna.py \
+    python3 ${CODE_DIR}/get_sgrna.py \
         -r ${REF_FA} \
         -i ${POS_DIR}/k_genome_pos_${x}.txt \
         -a 15 16 17 -l 19 \

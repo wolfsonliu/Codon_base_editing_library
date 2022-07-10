@@ -25,4 +25,10 @@ python3 ${CODE_DIR}/protein_aa_pos_2_genome_pos.py \
     -o ${DATA_DIR}/k_relationship_protein_genome_pos_no_splicing.txt \
     -s ${DATA_DIR}/k_relationship_protein_genome_pos_splicing.txt
 
+Rscript ${CODE_DIR}/split_splicing_aa.r \
+    ${DATA_DIR}/k_relationship_protein_genome_pos_splicing.txt \
+    ${DATA_DIR}/k_relationship_protein_genome_pos_splicing_12link.txt \
+    ${DATA_DIR}/k_relationship_protein_genome_pos_splicing_23link.txt
+
+
 ####################
